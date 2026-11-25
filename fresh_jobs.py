@@ -180,9 +180,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Anonymous Djinni freshness scan")
     parser.add_argument("-q", "--query", default="DevOps", help="free-text search (all_keywords)")
     parser.add_argument("-p", "--pages", type=int, default=2, help="listing pages to read (default 2)")
-    parser.add_argument("-c", "--check-limit", type=int, default=5,
-                        help="how many unseen jobs to open for published/updated (default 5)")
+    parser.add_argument("-c", "--check-limit", type=int, default=None,
+                        help="how many jobs to open for published/updated "
+                             "(default 5, or 15 with --today-only)")
     parser.add_argument("--no-check", action="store_true", help="do not open job pages at all")
+    parser.add_argument("--today-only", action="store_true",
+                        help="show only vacancies first published today; bumped ones are excluded")
     parser.add_argument("--cap", type=int, default=DEFAULT_CAP, help="anonymous requests per day")
     parser.add_argument("--pace", default="%.1f,%.1f" % DEFAULT_PACE,
                         help="seconds between requests, 'min,max'")
@@ -216,11 +219,22 @@ def main() -> None:
             if job["id"] and job["id"] not in collected:
                 collected[job["id"]] = job
 
+    today = datetime.date.today().isoformat()
     unseen = [job for job_id, job in collected.items() if job_id not in seen]
+    check_limit = args.check_limit if args.check_limit is not None else (15 if args.today_only else 5)
+
+    if args.today_only:
+        if args.no_check:
+            raise SystemExit("--today-only needs the job pages to know the publication date; drop --no-check")
+        # published_at <= posted_at, so a vacancy published today must also carry
+        # today's update date: this cheap pre-filter cannot miss a candidate.
+        candidates = [job for job in collected.values() if (job.get("posted_at") or "") == today]
+    else:
+        candidates = list(unseen)
 
     checked = 0
-    if not args.no_check and unseen:
-        for job in unseen[:max(0, args.check_limit)]:
+    if candidates:
+        for job in candidates[:max(0, check_limit)]:
             if budget.left() <= 0:
                 print("(budget exhausted, remaining jobs left UNVERIFIED)", file=sys.stderr)
                 break
@@ -229,10 +243,16 @@ def main() -> None:
             job["published_at"], job["updated_at"] = published, updated
             checked += 1
 
-    order = {"NEW": 0, "UNVERIFIED": 1, "BUMPED": 2}
-    unseen.sort(key=lambda j: (order.get(classify(j), 3), j.get("published_at") or j.get("posted_at") or "", j["id"]))
-
-    today = datetime.date.today().isoformat()
+    if args.today_only:
+        shown = [job for job in candidates if job.get("published_at") == today]
+        bumped = [job for job in candidates if job.get("published_at") and job["published_at"] != today]
+        unverified = [job for job in candidates if not job.get("published_at")]
+        shown.sort(key=lambda j: (j.get("posted_at") or "", j["id"]))
+    else:
+        order = {"NEW": 0, "UNVERIFIED": 1, "BUMPED": 2}
+        unseen.sort(key=lambda j: (order.get(classify(j), 3),
+                                   j.get("published_at") or j.get("posted_at") or "", j["id"]))
+        shown, bumped, unverified = unseen, [], []
     for job_id, job in collected.items():
         if job_id in seen:
             continue
@@ -242,30 +262,43 @@ def main() -> None:
     if args.json:
         print(json.dumps({
             "date": today, "query": args.query, "pages": fetched_pages,
-            "collected": len(collected), "unseen": len(unseen), "checked": checked,
+            "today_only": args.today_only, "collected": len(collected), "unseen": len(unseen),
+            "checked": checked, "shown": len(shown), "excluded_bumped": len(bumped),
+            "unverified": len(unverified),
             "budget_used": budget.used, "budget_left": budget.left(),
             "seeded_from_inbox": seeded, "initial_import": initial,
             "jobs": [{k: j.get(k) for k in ("id", "title", "company", "salary", "published_at",
                                             "updated_at", "posted_at", "url", "remote",
                                             "experience_years", "category")} | {"status": classify(j)}
-                     for j in unseen],
+                     for j in shown],
         }, ensure_ascii=False, indent=1))
         return
 
-    print(f"query: {args.query!r}  pages: {fetched_pages}  collected: {len(collected)}  "
-          f"new to us: {len(unseen)}  dates checked: {checked}  budget: {budget.used} used, {budget.left()} left")
-    if initial:
+    if args.today_only:
+        print(f"query: {args.query!r}  pages: {fetched_pages}  collected: {len(collected)}  "
+              f"candidates: {len(candidates)}  published today: {len(shown)}  "
+              f"bumped excluded: {len(bumped)}  unverified: {len(unverified)}  "
+              f"budget: {budget.used} used, {budget.left()} left")
+    else:
+        print(f"query: {args.query!r}  pages: {fetched_pages}  collected: {len(collected)}  "
+              f"new to us: {len(unseen)}  dates checked: {checked}  budget: {budget.used} used, {budget.left()} left")
+    if initial and not args.today_only:
         print("initial import: everything on the pages is 'new to us' — the seen-store was empty")
     if seeded:
         print(f"seeded from inbox: {seeded} vacancy ids marked as already seen")
-    if not unseen:
-        print("\nNothing new: every vacancy on these pages was already in the seen-store (bumped ones keep their id).")
+    if not shown:
+        if args.today_only:
+            print(f"\nNo vacancy on these pages was published today "
+                  f"({len(bumped)} were bumped, {len(unverified)} could not be checked).")
+        else:
+            print("\nNothing new: every vacancy on these pages was already in the seen-store "
+                  "(bumped ones keep their id).")
         return
 
     print()
     print("| # | status | title | company | link |")
     print("|---|---|---|---|---|")
-    for index, job in enumerate(unseen, 1):
+    for index, job in enumerate(shown, 1):
         title = (job.get("title") or "").replace("|", "/")[:60]
         company = (job.get("company") or "—").replace("|", "/")[:26]
         print(f"| {index} | {label(job)} | {title} | {company} | {job.get('url')} |")
